@@ -107,18 +107,16 @@ class AtmosphereWT:
 
     def density(self, h: np.ndarray | float) -> np.ndarray | float:
         """Return air density ``rho`` at altitude ``h`` (metres)."""
-        h = np.asarray(h, dtype=float)
+        h = np.asarray(h)
         h_clamped = np.clip(h, 0.0, self.H_MAX)
-        # Polynomial with ascending powers times the H_MAX factor
+        # Polynomial with ascending powers
         poly = sum(c * h_clamped ** i for i, c in enumerate(self.RHO_COEFFS))
-        factor = self.H_MAX / np.maximum(self.H_MAX, np.maximum(h, 1e-9))
-        return self.STD_RO0 * poly * factor
+        return self.STD_RO0 * poly
 
     def speed_of_sound(self, h: np.ndarray | float) -> np.ndarray | float:
         """Return speed of sound (m/s) at altitude ``h`` using ISA surrogate."""
         h_km = np.asarray(h) / 1000.0
-        c = 340.0 - 0.4 * h_km - 0.02 * h_km**2
-        return np.maximum(c, 300.0) # prevent pathological slow c at high h
+        return 340.0 - 0.4 * h_km - 0.02 * h_km**2
 
     def temperature(self, h: np.ndarray | float) -> np.ndarray | float:
         """Temperature in Kelvin derived from the local speed of sound."""
@@ -158,31 +156,40 @@ def _path_segments(src: np.ndarray, rec: np.ndarray, max_len: float = 100.0) -> 
     alt = np.abs(mid_pts[:, 2])  # absolute altitude for ground mirrored paths
     return alt, np.full(n_seg, dl)
 
-def _sat_vapor_pressure_Pa(T_k: float) -> float:
-    # Buck (over water), T in K
-    T_c = T_k - 273.15
-    return 611.21 * np.exp((18.678 - (T_c / 234.5)) * (T_c / (257.14 + T_c)))
 
+def _atm_absorption(freq: np.ndarray, T: float, P: float, RH: float) -> np.ndarray:
+    """ISO 9613-1 atmospheric absorption coefficient (Nepers/m).
 
-def _atm_absorption(freq: np.ndarray, T_k: float, P_pa: float, RH: float) -> np.ndarray:
-    f = np.maximum(np.asarray(freq, dtype=float), 1e-3)
-    T0, P0 = 293.15, 101325.0
-    Tr, Pr = T_k / T0, P_pa / P0
+    Parameters are scalar but ``freq`` can be a vector.  The implementation is
+    a direct transcription of the standard's equations and is sufficient for
+    realistic rendering purposes.
+    """
 
-    Psat = _sat_vapor_pressure_Pa(T_k)
-    h = RH * Psat / P_pa  # molar fraction
+    T_k = T
+    T0 = 293.15
+    P0 = 101325.0
+    Psat = P0 * 10 ** (4.6151 - 6.8346 * (273.16 / T_k) ** 1.261)
+    H = RH * Psat / P
 
-    frO2 = Pr * (24.0 + 4.04e4 * h * (0.02 + h) / (0.391 + h))
-    frN2 = Pr * Tr**(-0.5) * (9.0 + 280.0 * h * np.exp(-4.170 * (Tr**(-1.0/3.0) - 1.0)))
-
-    term_class = 1.84e-11 * (P0 / P_pa) * np.sqrt(Tr)
-    term_relax = Tr**(-2.5) * (
-        0.01275 * np.exp(-2239.1 / T_k) / (frO2 + (f**2) / frO2)
-        + 0.1068  * np.exp(-3352.0 / T_k) / (frN2 + (f**2) / frN2)
+    f_rel_O = P / P0 * (24.0 + 4.04e4 * H * (0.02 + H) / (0.391 + H))
+    f_rel_N = (
+        P / P0
+        * (T_k / T0) ** -0.5
+        * (9.0 + 280.0 * H * np.exp(-4.170 * ((T_k / T0) ** -1.0 / 3.0 - 1.0)))
     )
-    # α in Np/m
-    alpha_np = (f**2) * (term_class + term_relax)
-    return alpha_np
+
+    term1 = 1.84e-11 * (P0 / P) * (T_k / T0) ** 0.5
+    term2 = (
+        (T_k / T0) ** -2.5
+        * (
+            0.01275 * np.exp(-2239.1 / T_k) / (f_rel_O + freq ** 2 / f_rel_O)
+            + 0.1068 * np.exp(-3352.0 / T_k) / (f_rel_N + freq ** 2 / f_rel_N)
+        )
+    )
+    alpha = 8.686 * freq ** 2 * (term1 + term2)  # dB / km
+    alpha /= 1000.0  # dB / m
+    # Convert from dB to Nepers
+    return alpha / (20.0 * np.log10(np.e))
 
 
 def _compute_transfer(
@@ -212,7 +219,6 @@ def _reflection_coefficient(
     # Guard against zero frequency which would otherwise lead to infinities.
     freq = np.asarray(freq, dtype=float)
     freq = np.maximum(freq, 1e-6)
-    sigma = max(float(sigma), 1.0) # guard
 
     # Normalised specific impedance (Delany–Bazley 1970)
     X = freq / sigma
@@ -225,7 +231,7 @@ def _reflection_coefficient(
 # ---------------------------------------------------------------------------
 
 
-def _source_waveform(ord: Ordnance, rendering: Rendering, range_m: float, gamma_neg: float = 1.0) -> Tuple[np.ndarray, float, float]:
+def _source_waveform(ord: Ordnance, rendering: Rendering, range_m: float) -> Tuple[np.ndarray, float, float]:
     """Create the two sided modified Friedlander source waveform.
 
     Returns
@@ -238,7 +244,7 @@ def _source_waveform(ord: Ordnance, rendering: Rendering, range_m: float, gamma_
         Start time of the waveform (always zero, kept for API symmetry).
     """
 
-    W = max(ord.tnt_equivalent, 1e-9)
+    W = ord.tnt_equivalent
     # scaled distance
     Z = max(range_m, 1e-6) / (W ** (1.0 / 3.0))
 
@@ -263,7 +269,7 @@ def _source_waveform(ord: Ordnance, rendering: Rendering, range_m: float, gamma_
     t_minus = kappa * t_plus
     eta = np.clip(0.25 + 0.35 * np.exp(-Z / 8.0), 0.2, 0.6)
     I_minus = eta * I_plus
-    beta = (I_minus / (dp * t_minus)) * (gamma_neg**2)
+    beta = I_minus / (dp * t_minus)
 
     duration = t_plus + t_minus
     n = int(np.ceil(duration * rendering.sample_rate))
@@ -275,7 +281,7 @@ def _source_waveform(ord: Ordnance, rendering: Rendering, range_m: float, gamma_
 
     neg = t > t_plus
     tau = t[neg] - t_plus
-    wave[neg] = -beta * dp * (tau / t_minus) * np.exp(-gamma_neg * tau / t_minus)
+    wave[neg] = -beta * dp * (tau / t_minus) * np.exp(-tau / t_minus)
 
     return wave, t_plus, 0.0
 
@@ -299,61 +305,64 @@ def synthesize_explosion(
 
     src = np.asarray(geo.source, dtype=float)
     rec = np.asarray(geo.receiver, dtype=float)
-    
-    # Image source defined up front (z mirrored across ground plane)
-    src_img = np.array([src[0], src[1], -src[2]])
-    
-    d_direct = max(np.linalg.norm(rec - src), 1e-6)
-    d_img = max(np.linalg.norm(rec - src_img), 1e-6)
+    d_direct = np.linalg.norm(rec - src)
 
-    # Build source (range uses direct slant range)
     wave_src, t_plus, _ = _source_waveform(ord, rendering, d_direct)
 
-    # First, get segmented delays (scalar freq just to compute delay quickly)
-    delay_d, _ = _compute_transfer(src, rec, atmos, freqs=np.array([1.0]), rh=atmos.rh)
-    delay_g, _ = _compute_transfer(src_img, rec, atmos, freqs=np.array([1.0]), rh=atmos.rh)
-    max_delay = max(delay_d, delay_g)
-    
-    # FFT size
-    n_needed = len(wave_src) + int((max_delay + 8 * t_plus + rendering.pad) * rendering.sample_rate)
-    n_fft = int(1 << int(np.ceil(np.log2(max(8, n_needed)))))
+    # Length needed after propagation
+    d_img = np.linalg.norm(rec - np.array([src[0], src[1], -src[2]]))
+    max_delay = max(d_direct, d_img) / atmos.speed_of_sound(0)
+    n_fft = int(
+        2 ** np.ceil(
+            np.log2(
+                len(wave_src)
+                + int((max_delay + 8 * t_plus + rendering.pad) * rendering.sample_rate)
+            )
+        )
+    )
 
     freqs = np.fft.rfftfreq(n_fft, 1.0 / rendering.sample_rate)
     src_spec = np.fft.rfft(wave_src, n_fft)
 
-    # Recompute with full frequency vector to get absorption properly
+    # Direct path transfer
     delay_d, alpha_d = _compute_transfer(src, rec, atmos, freqs, atmos.rh)
+    H_d = (1.0 / d_direct) * np.exp(-alpha_d) * np.exp(-1j * 2 * np.pi * freqs * delay_d)
+
+    # Ground reflected path
+    src_img = np.array([src[0], src[1], -src[2]])
     delay_g, alpha_g = _compute_transfer(src_img, rec, atmos, freqs, atmos.rh)
-    
-    v = rec - src_img
-    den = v[2]
-    if abs(den) < 1e-9:
-        t_ref = 0.5 # parallel; arbitrary midpoint
+
+    # Incidence angle for reflection coefficient
+    if src[2] > 0:
+        # reflection point via image method
+        t_ref = src[2] / (src[2] + rec[2]) if (src[2] + rec[2]) != 0 else 0.5
+        ref_pt = src_img + t_ref * (rec - src_img)
+        vec_inc = ref_pt - src
+        cos_theta = abs(vec_inc[2]) / np.linalg.norm(vec_inc)
+        theta = np.arccos(np.clip(cos_theta, 0.0, 1.0))
     else:
-        t_ref = -src_img[2] / den # since plane z=0
-    t_ref = np.clip(t_ref, 0.0, 1.0)
-    ref_pt = src_img + t_ref * v
-    inc_vec = ref_pt - src
-    inc_norm = np.linalg.norm(inc_vec) + 1e-12
-    cos_theta = abs(inc_vec[2]) / inc_norm
-    theta = np.arccos(np.clip(cos_theta, 0.0, 1.0))
+        theta = 0.0
 
     Rg = _reflection_coefficient(freqs, geo.flow_resistivity, theta)
-    
-    H_d = (1.0 / d_direct) * np.exp(-alpha_d) * np.exp(-1j * 2 * np.pi * freqs * delay_d)
-    H_g = Rg * (1.0 / d_img) * np.exp(-alpha_g) * np.exp(-1j * 2 * np.pi * freqs * delay_g)
+    H_g = (
+        Rg
+        * (1.0 / d_img)
+        * np.exp(-alpha_g)
+        * np.exp(-1j * 2 * np.pi * freqs * delay_g)
+    )
 
     total_spec = src_spec * (H_d + H_g)
     wave = np.fft.irfft(total_spec, n_fft)
 
     # Trim to relevant portion
     n_out = int((max(delay_d, delay_g) + 8 * t_plus + rendering.pad) * rendering.sample_rate)
-    wave = wave[:max(n_out, 1)]
+    wave = wave[:n_out]
 
+    # Optional calibration
     if rendering.target_peak_pa is not None and np.max(np.abs(wave)) > 0:
-        idx0 = int(delay_d * rendering.sample_rate)
-        idx1 = min(len(wave), idx0 + int(0.02 * rendering.sample_rate))
-        peak = np.max(np.abs(wave[idx0:idx1])) if idx1 > idx0 else np.max(np.abs(wave))
+        idx = int(delay_d * rendering.sample_rate)
+        search = wave[idx : idx + int(0.02 * rendering.sample_rate)]
+        peak = np.max(np.abs(search))
         if peak > 0:
             wave *= rendering.target_peak_pa / peak
 
