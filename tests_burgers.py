@@ -25,7 +25,8 @@ def _render(distance, sr, use_burgers):
     ord = Ordnance(10.0)
     geo = Geometry(source=(0.0, 0.0, 1.0), receiver=(distance, 0.0, 1.7))
     atmos = AtmosphereWT(rh=0.5)
-    return synthesize_explosion(ord, geo, atmos, Rendering(sample_rate=sr, pad=0.1, use_burgers=use_burgers))
+    render = Rendering(sample_rate=sr, pad=0.1, use_burgers=use_burgers, enable_source_shaper=False)
+    return synthesize_explosion(ord, geo, atmos, render)
 
 
 def test_burgers_50m():
