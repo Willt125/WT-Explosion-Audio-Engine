@@ -25,18 +25,21 @@ Two convenience helpers are provided:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Tuple
+from typing import Callable, Iterable, Tuple, Union
 import numpy as np
 from scipy.io import wavfile
 
 __all__ = [
     "Ordnance",
     "Geometry",
+    "LinearMotion",
     "AtmosphereWT",
     "Rendering",
     "synthesize_explosion",
+    "synthesize_explosion_tv",
     "synthesize_simple",
     "save_wav",
+    "solve_retarded_time",
 ]
 
 
@@ -72,11 +75,36 @@ class Ordnance:
 
 @dataclass
 class Geometry:
-    """Spatial configuration of source, receiver and ground properties."""
+    """Spatial configuration of source, receiver and ground properties.
 
-    source: Tuple[float, float, float]
-    receiver: Tuple[float, float, float]
-    flow_resistivity: float = 1e7  # Pa·s/m², high => rigid ground
+    ``source`` and ``receiver`` may be provided either as fixed 3-tuples or
+    callables returning a 3-tuple for a given receiver time in seconds.  During
+    initialisation canonical callables ``src_fn`` and ``rec_fn`` are created so
+    downstream code can uniformly query positions.
+    """
+
+    source: Union[Tuple[float, float, float], Callable[[float], Tuple[float, float, float]]]
+    receiver: Union[Tuple[float, float, float], Callable[[float], Tuple[float, float, float]]]
+    flow_resistivity: float = 5e4  # Pa·s/m², soil/grass default
+
+    def __post_init__(self) -> None:  # pragma: no cover - simple wrappers
+        self.src_fn = self.source if callable(self.source) else (lambda t, p=self.source: p)
+        self.rec_fn = self.receiver if callable(self.receiver) else (lambda t, p=self.receiver: p)
+
+
+Vec3 = Tuple[float, float, float]
+PositionFn = Callable[[float], Vec3]
+
+
+@dataclass
+class LinearMotion:
+    """Helper describing linear motion: ``x(t) = x0 + v*t``."""
+
+    x0: Vec3
+    v: Vec3
+
+    def __call__(self, t: float) -> Vec3:  # pragma: no cover - straightforward
+        return (self.x0[0] + self.v[0] * t, self.x0[1] + self.v[1] * t, self.x0[2] + self.v[2] * t)
 
 
 @dataclass
@@ -155,6 +183,97 @@ def _path_segments(src: np.ndarray, rec: np.ndarray, max_len: float = 100.0) -> 
     mid_pts = src + np.outer(t_mid, vec)
     alt = np.abs(mid_pts[:, 2])  # absolute altitude for ground mirrored paths
     return alt, np.full(n_seg, dl)
+
+
+def solve_retarded_time(src_fn: PositionFn, rec_fn: PositionFn, t_r: float, atmos: AtmosphereWT) -> Tuple[float, float, float]:
+    """Solve for emission time ``t_e`` via fixed-point iteration.
+
+    Returns the emission time, path length and segment-averaged speed of sound.
+    """
+
+    x_r = np.array(rec_fn(t_r), float)
+    c0 = float(atmos.speed_of_sound(x_r[2]))
+    x_s_guess = np.array(src_fn(t_r), float)
+    D0 = np.linalg.norm(x_r - x_s_guess)
+    t_e = t_r - D0 / max(c0, 1e-6)
+
+    for _ in range(4):
+        x_s = np.array(src_fn(t_e), float)
+        D = np.linalg.norm(x_r - x_s) + 1e-12
+        alt, seg_len = _path_segments(x_s, x_r, max_len=100.0)
+        c_seg = atmos.speed_of_sound(alt)
+        c_bar = float(np.sum(seg_len) / np.sum(seg_len / np.maximum(c_seg, 1.0)))
+        c_bar = max(c_bar, 300.0)
+        t_e_new = t_r - D / c_bar
+        if abs(t_e_new - t_e) < 1e-6:
+            t_e = t_e_new
+            break
+        t_e = t_e_new
+    else:
+        x_s = np.array(src_fn(t_e), float)
+        D = np.linalg.norm(x_r - x_s) + 1e-12
+        alt, seg_len = _path_segments(x_s, x_r, max_len=100.0)
+        c_seg = atmos.speed_of_sound(alt)
+        c_bar = float(np.sum(seg_len) / np.sum(seg_len / np.maximum(c_seg, 1.0)))
+        c_bar = max(c_bar, 300.0)
+
+    return t_e, D, c_bar
+
+
+def make_source_spline(p_src: np.ndarray, sr: int):
+    from scipy.interpolate import CubicSpline
+
+    t = np.arange(len(p_src)) / sr
+    return CubicSpline(t, p_src, bc_type="natural", extrapolate=False)
+
+
+def incidence_angle_for_ground(xs: Vec3, xr: Vec3) -> float:
+    xs_img = (xs[0], xs[1], -xs[2])
+    v = np.array(xr) - np.array(xs_img)
+    if abs(v[2]) < 1e-12:
+        t_ref = 0.5
+    else:
+        t_ref = -xs_img[2] / v[2]
+    t_ref = float(np.clip(t_ref, 0.0, 1.0))
+    ref_pt = np.array(xs_img) + t_ref * v
+    inc = ref_pt - np.array(xs)
+    cos_th = abs(inc[2]) / (np.linalg.norm(inc) + 1e-12)
+    return float(np.arccos(np.clip(cos_th, 0.0, 1.0)))
+
+
+def design_absorption_fir(D_ref: float, atmos: AtmosphereWT, sr: int, taps: int = 512) -> np.ndarray:
+    """Design a minimum-phase FIR modelling air absorption."""
+
+    n_fft = taps * 2
+    freqs = np.fft.rfftfreq(n_fft, 1.0 / sr)
+    T = float(atmos.temperature(0.0))
+    P = float(atmos.pressure(0.0))
+    alpha = _atm_absorption(freqs, T, P, atmos.rh)
+    mag = np.exp(-alpha * D_ref)
+    spec = mag.astype(complex)
+    h_lin = np.fft.irfft(spec, n_fft)
+    from scipy.signal import minimum_phase
+
+    h_min = minimum_phase(h_lin[:taps], method="homomorphic")
+    if np.sum(h_min) > 0:
+        h_min /= np.sum(h_min)
+    return h_min.astype(float)
+
+
+def _one_pole_hp(x: np.ndarray, fc: float, sr: int) -> np.ndarray:
+    """Simple one-pole high-pass filter."""
+
+    if fc <= 0:
+        return x
+    dt = 1.0 / sr
+    tau = 1.0 / (2 * np.pi * fc)
+    a = tau / (tau + dt)
+    y = np.zeros_like(x)
+    prev_x = x[0] if len(x) else 0.0
+    for n in range(1, len(x)):
+        y[n] = a * (y[n - 1] + x[n] - prev_x)
+        prev_x = x[n]
+    return y
 
 
 def _atm_absorption(freq: np.ndarray, T: float, P: float, RH: float) -> np.ndarray:
@@ -287,6 +406,85 @@ def _source_waveform(ord: Ordnance, rendering: Rendering, range_m: float) -> Tup
 
 
 # ---------------------------------------------------------------------------
+# Time-varying propagation path
+# ---------------------------------------------------------------------------
+
+
+def _estimate_max_delay(geo: Geometry, atmos: AtmosphereWT) -> float:
+    src0 = np.array(geo.src_fn(0.0), float)
+    rec0 = np.array(geo.rec_fn(0.0), float)
+    d_direct = np.linalg.norm(rec0 - src0)
+    src_img = np.array([src0[0], src0[1], -src0[2]])
+    d_img = np.linalg.norm(rec0 - src_img)
+    c0 = float(atmos.speed_of_sound(0.0))
+    return max(d_direct, d_img) / max(c0, 1.0)
+
+
+def synthesize_explosion_tv(
+    ord: Ordnance,
+    geo: Geometry,
+    atmos: AtmosphereWT,
+    rendering: Rendering,
+) -> np.ndarray:
+    """Time-varying propagation with Doppler via retarded-time resampling."""
+
+    if not callable(geo.source) and not callable(geo.receiver):
+        # For purely static geometries fall back to the reference implementation
+        return synthesize_explosion(ord, geo, atmos, rendering)
+
+    sr = rendering.sample_rate
+    d_ref = np.linalg.norm(np.array(geo.rec_fn(0.0), float) - np.array(geo.src_fn(0.0), float))
+    p_src, t_plus, _ = _source_waveform(ord, rendering, range_m=max(d_ref, 1e-6))
+    spline = make_source_spline(p_src, sr)
+
+    T_out = (len(p_src) / sr) + _estimate_max_delay(geo, atmos) + rendering.pad
+    n_out = int(np.ceil(T_out * sr))
+    y = np.zeros(n_out, dtype=float)
+
+    D_samples = []
+    for k in range(0, n_out, max(1, sr // 50)):
+        t_r = k / sr
+        t_e, D, _ = solve_retarded_time(geo.src_fn, geo.rec_fn, t_r, atmos)
+        D_samples.append(D)
+    D_ref = float(np.mean(D_samples)) if D_samples else 100.0
+    h_absorb = design_absorption_fir(D_ref, atmos, sr, taps=512)
+
+    for n in range(n_out):
+        t_r = n / sr
+
+        t_e, Dd, _ = solve_retarded_time(geo.src_fn, geo.rec_fn, t_r, atmos)
+        pd_val = spline(t_e) if 0.0 <= t_e <= len(p_src) / sr else 0.0
+        pd = float(pd_val) if np.isfinite(pd_val) else 0.0
+        yd = pd / max(Dd, 1e-6)
+
+        def src_img_fn(te: float) -> Vec3:
+            x = geo.src_fn(te)
+            return (x[0], x[1], -x[2])
+
+        t_ei, Dg, _ = solve_retarded_time(src_img_fn, geo.rec_fn, t_r, atmos)
+        pg_val = spline(t_ei) if 0.0 <= t_ei <= len(p_src) / sr else 0.0
+        pg = float(pg_val) if np.isfinite(pg_val) else 0.0
+
+        theta = incidence_angle_for_ground(geo.src_fn(t_ei), geo.rec_fn(t_r))
+        Rg_bb = float(np.real(_reflection_coefficient(np.array([1000.0]), geo.flow_resistivity, theta)[0]))
+        Rg_bb = float(np.clip(Rg_bb, -1.0, 1.0))
+        yg = (Rg_bb * pg) / max(Dg, 1e-6)
+
+        y[n] = yd + yg
+
+    from scipy.signal import fftconvolve
+
+    y = fftconvolve(y, h_absorb, mode="same")
+    y = _one_pole_hp(y, fc=1.0, sr=sr)
+
+    if rendering.target_peak_pa is not None and np.max(np.abs(y)) > 0:
+        peak = np.max(np.abs(y))
+        if peak > 0:
+            y *= rendering.target_peak_pa / peak
+
+    return y
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -302,6 +500,9 @@ def synthesize_explosion(
     The function returns an array of pressure values in Pascals sampled at
     ``rendering.sample_rate``.
     """
+
+    if callable(geo.source) or callable(geo.receiver):
+        return synthesize_explosion_tv(ord, geo, atmos, rendering)
 
     src = np.asarray(geo.source, dtype=float)
     rec = np.asarray(geo.receiver, dtype=float)
