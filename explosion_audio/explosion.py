@@ -7,14 +7,16 @@ and ``scipy`` are required.
 
 High level usage::
 
-    from explosion import Ordnance, Geometry, AtmosphereWT, Rendering
-    from explosion import synthesize_explosion, save_wav
+    from explosion_audio.explosion import Ordnance, Geometry, AtmosphereWT, Rendering
+    from explosion_audio.explosion import synthesize_explosion, save_wav
+    from explosion_audio.world.flat import FlatWorld
 
     ordnance = Ordnance(filler_mass=10.0, re=1.0, height_of_burst=0.0)
     geometry = Geometry(source=(0, 0, 1.0), receiver=(100.0, 0, 1.7))
     atmos    = AtmosphereWT(rh=0.5)
     render   = Rendering(sample_rate=96000, pad=0.5)
-    wave = synthesize_explosion(ordnance, geometry, atmos, render)
+    world    = FlatWorld(z0=0.0, ground_material_id=2)
+    wave = synthesize_explosion(ordnance, geometry, atmos, render, world)
     save_wav("demo.wav", render.sample_rate, wave)
 
 Two convenience helpers are provided:
@@ -28,6 +30,8 @@ from dataclasses import dataclass
 from typing import Callable, Iterable, Tuple, Union
 import numpy as np
 from scipy.io import wavfile
+
+from .world.api import AcousticWorld, Plane
 
 __all__ = [
     "Ordnance",
@@ -188,17 +192,40 @@ class Rendering:
 # ---------------------------------------------------------------------------
 
 
-def _path_segments(src: np.ndarray, rec: np.ndarray, max_len: float = 100.0) -> Tuple[np.ndarray, np.ndarray]:
+def _path_segments(
+    src: np.ndarray,
+    rec: np.ndarray,
+    max_len: float = 100.0,
+    world: AcousticWorld | None = None,
+) -> Tuple[np.ndarray, np.ndarray]:
     """Return mid-point altitudes and segment lengths along the straight path."""
+
     vec = rec - src
     dist = np.linalg.norm(vec)
     n_seg = max(1, int(np.ceil(dist / max_len)))
-    # Segment lengths are equal
     dl = dist / n_seg
     t_mid = (np.arange(n_seg) + 0.5) / n_seg
     mid_pts = src + np.outer(t_mid, vec)
-    alt = np.abs(mid_pts[:, 2])  # absolute altitude for ground mirrored paths
+    if world is None:
+        alt = np.abs(mid_pts[:, 2])
+    else:
+        z_ground = np.array([world.elevation(float(x), float(y)) for x, y in mid_pts[:, :2]])
+        alt = np.maximum(mid_pts[:, 2], z_ground)
     return alt, np.full(n_seg, dl)
+
+
+def reflect_point_across_plane(point: Vec3, plane: Plane) -> np.ndarray:
+    """Reflect a point across a plane.
+
+    Parameters are ENU coordinates in metres. Returns the reflected point as a
+    NumPy array.
+    """
+
+    p = np.asarray(point, float)
+    n = np.asarray(plane.normal, float)
+    n = n / (np.linalg.norm(n) + 1e-12)
+    pp = np.asarray(plane.point, float)
+    return p - 2.0 * np.dot(p - pp, n) * n
 
 
 def solve_retarded_time(src_fn: PositionFn, rec_fn: PositionFn, t_r: float, atmos: AtmosphereWT) -> Tuple[float, float, float]:
@@ -386,10 +413,11 @@ def _compute_transfer(
     atmos: AtmosphereWT,
     freqs: np.ndarray,
     rh: float,
+    world: AcousticWorld | None = None,
 ) -> Tuple[float, np.ndarray]:
     """Return delay and absorption along path in frequency domain."""
 
-    alt, dl = _path_segments(src, rec)
+    alt, dl = _path_segments(src, rec, world=world)
     delay = np.sum(dl / atmos.speed_of_sound(alt))
     alpha = np.zeros_like(freqs)
     for h, d in zip(alt, dl):
@@ -661,11 +689,13 @@ def synthesize_explosion(
     geo: Geometry,
     atmos: AtmosphereWT,
     rendering: Rendering,
+    world: AcousticWorld | None = None,
 ) -> np.ndarray:
     """Synthesise an outdoor explosion pressure waveform.
 
-    The function returns an array of pressure values in Pascals sampled at
-    ``rendering.sample_rate``.
+    Parameters are expressed in ENU coordinates (metres, Z-up). ``world``
+    provides terrain and material queries; if ``None`` a flat ground model with
+    flow resistivity from ``geo`` is used for backward compatibility.
     """
 
     if callable(geo.source) or callable(geo.receiver):
@@ -677,11 +707,19 @@ def synthesize_explosion(
 
     wave_src, t_plus, _ = _source_waveform(ord, rendering, d_direct)
 
-    # Length needed after propagation
-    d_img = np.linalg.norm(rec - np.array([src[0], src[1], -src[2]]))
-    max_delay = max(d_direct, d_img) / atmos.speed_of_sound(0)
+    planes = world.image_surface_candidates(tuple(src), tuple(rec), max_order=1) if world else []
+    path_dists = [d_direct]
+    if world is None:
+        src_img = np.array([src[0], src[1], -src[2]])
+        path_dists.append(np.linalg.norm(rec - src_img))
+    else:
+        for pl in planes:
+            src_img = reflect_point_across_plane(src, pl)
+            path_dists.append(np.linalg.norm(rec - src_img))
+    max_delay = max(path_dists) / atmos.speed_of_sound(0)
     n_fft = int(
-        2 ** np.ceil(
+        2
+        ** np.ceil(
             np.log2(
                 len(wave_src)
                 + int((max_delay + 8 * t_plus + rendering.pad) * rendering.sample_rate)
@@ -695,58 +733,87 @@ def synthesize_explosion(
         wave_src = apply_source_shaper(wave_src, rendering.sample_rate, S_mp)
     src_spec = np.fft.rfft(wave_src, n_fft)
 
-    # Direct and ground path transfers
-    delay_d, alpha_d = _compute_transfer(src, rec, atmos, freqs, atmos.rh)
-    src_img = np.array([src[0], src[1], -src[2]])
-    delay_g, alpha_g = _compute_transfer(src_img, rec, atmos, freqs, atmos.rh)
-
     vec_dir = rec - src
     D_dir = _directivity_scalar(ord, vec_dir) if rec[2] >= 0 else 1.0
 
-    if src[2] > 0:
-        t_ref = src[2] / (src[2] + rec[2]) if (src[2] + rec[2]) != 0 else 0.5
-        ref_pt = src_img + t_ref * (rec - src_img)
-        vec_inc = ref_pt - src
-        D_img = _directivity_scalar(ord, vec_inc) if rec[2] >= 0 else 1.0
-        cos_theta = abs(vec_inc[2]) / np.linalg.norm(vec_inc)
-        theta = np.arccos(np.clip(cos_theta, 0.0, 1.0))
-    else:
-        theta = 0.0
-        D_img = 1.0
+    delay_d, alpha_d = _compute_transfer(src, rec, atmos, freqs, atmos.rh, world)
 
-    Rg = _reflection_coefficient(freqs, geo.flow_resistivity, theta)
+    specs: list[np.ndarray] = []
+    delays: list[float] = []
+    dists: list[float] = []
 
     if rendering.use_burgers:
         H_d = (1.0 / d_direct) * np.exp(-1j * 2 * np.pi * freqs * delay_d)
-        H_g = Rg * (1.0 / d_img) * np.exp(-1j * 2 * np.pi * freqs * delay_g)
     else:
         H_d = (1.0 / d_direct) * np.exp(-alpha_d) * np.exp(-1j * 2 * np.pi * freqs * delay_d)
-        H_g = (
-            Rg
-            * (1.0 / d_img)
-            * np.exp(-alpha_g)
-            * np.exp(-1j * 2 * np.pi * freqs * delay_g)
-        )
-
     H_d *= D_dir
-    H_g *= D_img
+    specs.append(src_spec * H_d)
+    delays.append(delay_d)
+    dists.append(d_direct)
 
-    spec_d = src_spec * H_d
-    spec_g = src_spec * H_g
-    wave_d = np.fft.irfft(spec_d, n_fft)
-    wave_g = np.fft.irfft(spec_g, n_fft)
+    if world is None:
+        src_img = np.array([src[0], src[1], -src[2]])
+        delay_g, alpha_g = _compute_transfer(src_img, rec, atmos, freqs, atmos.rh)
+        d_img = np.linalg.norm(rec - src_img)
+        if src[2] > 0:
+            t_ref = src[2] / (src[2] + rec[2]) if (src[2] + rec[2]) != 0 else 0.5
+            ref_pt = src_img + t_ref * (rec - src_img)
+            vec_inc = ref_pt - src
+            D_img = _directivity_scalar(ord, vec_inc) if rec[2] >= 0 else 1.0
+            cos_theta = abs(vec_inc[2]) / np.linalg.norm(vec_inc)
+            theta = np.arccos(np.clip(cos_theta, 0.0, 1.0))
+        else:
+            theta = 0.0
+            D_img = 1.0
+        Rg = _reflection_coefficient(freqs, geo.flow_resistivity, theta)
+        if rendering.use_burgers:
+            H_g = Rg * (1.0 / d_img) * np.exp(-1j * 2 * np.pi * freqs * delay_g)
+        else:
+            H_g = Rg * (1.0 / d_img) * np.exp(-alpha_g) * np.exp(-1j * 2 * np.pi * freqs * delay_g)
+        H_g *= D_img
+        specs.append(src_spec * H_g)
+        delays.append(delay_g)
+        dists.append(d_img)
+    else:
+        for plane in planes:
+            src_img = reflect_point_across_plane(src, plane)
+            hit = world.raycast(tuple(src_img), tuple(rec))
+            if not hit.hit:
+                continue
+            refl_pt = np.asarray(hit.point, float)
+            vec_inc = refl_pt - src
+            D_img = _directivity_scalar(ord, vec_inc) if rec[2] >= 0 else 1.0
+            cos_theta = abs(np.dot(vec_inc, hit.normal)) / (np.linalg.norm(vec_inc) + 1e-12)
+            theta = float(np.arccos(np.clip(cos_theta, 0.0, 1.0)))
+            sigma = world.impedance_at(refl_pt[0], refl_pt[1])
+            Rg = _reflection_coefficient(freqs, sigma, theta)
+            d_img = np.linalg.norm(rec - src_img)
+            delay_g, alpha_g = _compute_transfer(src_img, rec, atmos, freqs, atmos.rh, world)
+            if rendering.use_burgers:
+                H_g = Rg * (1.0 / d_img) * np.exp(-1j * 2 * np.pi * freqs * delay_g)
+            else:
+                H_g = (
+                    Rg
+                    * (1.0 / d_img)
+                    * np.exp(-alpha_g)
+                    * np.exp(-1j * 2 * np.pi * freqs * delay_g)
+                )
+            H_g *= D_img
+            specs.append(src_spec * H_g)
+            delays.append(delay_g)
+            dists.append(d_img)
 
+    waves = [np.fft.irfft(spec, n_fft) for spec in specs]
     if rendering.use_burgers:
-        wave_d = propagate_burgers(wave_d, d_direct, atmos, rendering.sample_rate)
-        wave_g = propagate_burgers(wave_g, d_img, atmos, rendering.sample_rate)
+        waves = [
+            propagate_burgers(w, d, atmos, rendering.sample_rate) for w, d in zip(waves, dists)
+        ]
 
-    wave = wave_d + wave_g
+    wave = np.sum(waves, axis=0)
 
-    # Trim to relevant portion
-    n_out = int((max(delay_d, delay_g) + 8 * t_plus + rendering.pad) * rendering.sample_rate)
+    n_out = int((max(delays) + 8 * t_plus + rendering.pad) * rendering.sample_rate)
     wave = wave[:n_out]
 
-    # Optional calibration
     if rendering.target_peak_pa is not None and np.max(np.abs(wave)) > 0:
         idx = int(delay_d * rendering.sample_rate)
         search = wave[idx : idx + int(0.02 * rendering.sample_rate)]
@@ -778,7 +845,10 @@ def synthesize_simple(
     geo = Geometry((0.0, 0.0, src_height), (range_m, 0.0, rec_height), sigma)
     atmos = AtmosphereWT(rh)
     render = Rendering(sample_rate, pad)
-    wave = synthesize_explosion(ord, geo, atmos, render)
+    from .world.flat import FlatWorld
+
+    world = FlatWorld(z0=0.0, ground_material_id=2)
+    wave = synthesize_explosion(ord, geo, atmos, render, world)
     return wave, render.sample_rate
 
 

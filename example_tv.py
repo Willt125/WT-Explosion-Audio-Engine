@@ -1,6 +1,6 @@
 """Example demonstrating time-varying explosion synthesis with motion."""
 
-from explosion import (
+from explosion_audio.explosion import (
     AtmosphereWT,
     Geometry,
     LinearMotion,
@@ -9,6 +9,7 @@ from explosion import (
     save_wav,
     synthesize_explosion,
 )
+from explosion_audio.world.flat import FlatWorld
 
 
 if __name__ == "__main__":
@@ -17,6 +18,7 @@ if __name__ == "__main__":
     geometry = Geometry(source=src_motion, receiver=(0.0, 0.0, 1.7))
     atmos = AtmosphereWT(rh=0.5)
     render = Rendering(sample_rate=96000, pad=1.0)
-    wave = synthesize_explosion(ordnance, geometry, atmos, render)
+    world = FlatWorld(z0=0.0, ground_material_id=2)
+    wave = synthesize_explosion(ordnance, geometry, atmos, render, world)
     save_wav("example_tv.wav", render.sample_rate, wave)
     print("Wrote example_tv.wav")
