@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 from scipy.ndimage import maximum_filter1d
 from scipy.signal import spectrogram
 
-from explosion import (
+from ..explosion import (
     AtmosphereWT,
     Geometry,
     LinearMotion,
@@ -61,7 +61,7 @@ def test_energy_falloff():
     geo = Geometry(source=src, receiver=rec_motion)
     atmos = AtmosphereWT(rh=0.0)
     render = Rendering(sample_rate=8000, pad=0.2, use_burgers=False)
-    import explosion
+    from .. import explosion
 
     orig_design = explosion.design_absorption_fir
     explosion.design_absorption_fir = lambda D_ref, atmos, sr, taps=512: np.array([1.0])

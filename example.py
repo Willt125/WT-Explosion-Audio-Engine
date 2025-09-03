@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from explosion import (
+from explosion_audio.explosion import (
     Ordnance,
     Geometry,
     AtmosphereWT,
@@ -10,6 +10,7 @@ from explosion import (
     synthesize_explosion,
     save_wav,
 )
+from explosion_audio.world.flat import FlatWorld
 
 
 def main() -> None:
@@ -21,13 +22,14 @@ def main() -> None:
     geo1 = Geometry(source=(0, 0, 1.0), receiver=(100.0, 0, 1.7))
     atmos = AtmosphereWT(rh=0.5)
     render = Rendering(sample_rate=96_000, pad=0.5)
-    wave = synthesize_explosion(ord1, geo1, atmos, render)
+    world = FlatWorld(z0=0.0, ground_material_id=2)
+    wave = synthesize_explosion(ord1, geo1, atmos, render, world)
     save_wav(out_dir / "bomb_10kg_100m.wav", render.sample_rate, wave)
 
     # Example 2: 1 kg charge at 20 m with slight height-of-burst
     ord2 = Ordnance(filler_mass=1.0, re=1.0, height_of_burst=2.0)
     geo2 = Geometry(source=(0, 0, 2.0), receiver=(20.0, 0, 1.7))
-    wave2 = synthesize_explosion(ord2, geo2, atmos, render)
+    wave2 = synthesize_explosion(ord2, geo2, atmos, render, world)
     save_wav(out_dir / "shell_1kg_20m.wav", render.sample_rate, wave2)
 
 
