@@ -35,6 +35,7 @@ __all__ = [
     "LinearMotion",
     "AtmosphereWT",
     "Rendering",
+    "propagate_burgers",
     "synthesize_explosion",
     "synthesize_explosion_tv",
     "synthesize_simple",
@@ -165,6 +166,7 @@ class Rendering:
     sample_rate: int = 96_000
     pad: float = 0.5  # seconds of trailing silence
     target_peak_pa: float | None = None
+    use_burgers: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -309,6 +311,48 @@ def _atm_absorption(freq: np.ndarray, T: float, P: float, RH: float) -> np.ndarr
     alpha /= 1000.0  # dB / m
     # Convert from dB to Nepers
     return alpha / (20.0 * np.log10(np.e))
+
+
+def propagate_burgers(wave: np.ndarray, d: float, atmos: AtmosphereWT, sr: int) -> np.ndarray:
+    """Propagate ``wave`` over distance ``d`` using a lossy Burgers solver.
+
+    A frequency-domain split–step method alternates nonlinear distortion in the
+    time domain with linear absorption in the frequency domain.  ``wave`` is
+    assumed to represent the pressure at the start of the path after geometric
+    spreading.  The output has the same length as the input.
+    """
+
+    wave = np.asarray(wave, dtype=float)
+    if d <= 0 or not len(wave):
+        return wave.copy()
+
+    rho = float(atmos.density(0.0))
+    c = float(atmos.speed_of_sound(0.0))
+    beta = (atmos.GAMMA + 1.0) / 2.0
+
+    steps_per_100m = 6.0
+    n_steps = max(1, int(np.ceil(d * steps_per_100m / 100.0)))
+    dx = d / n_steps
+
+    n = len(wave)
+    n_fft = int(2 ** np.ceil(np.log2(n)))
+    freqs = np.fft.rfftfreq(n_fft, 1.0 / sr)
+    T = float(atmos.temperature(0.0))
+    P = float(atmos.pressure(0.0))
+    alpha = _atm_absorption(freqs, T, P, atmos.rh)
+    lp_mask = freqs <= 0.9 * (sr * 0.5)
+
+    p = wave.astype(float, copy=True)
+    for _ in range(n_steps):
+        dp_dt = np.gradient(p, 1.0 / sr)
+        p = p + dx * (beta / (rho * c ** 3)) * p * dp_dt
+
+        spec = np.fft.rfft(p, n_fft)
+        spec[~lp_mask] = 0.0
+        spec *= np.exp(-alpha * dx)
+        p = np.fft.irfft(spec, n_fft)[:n]
+
+    return p
 
 
 def _compute_transfer(
@@ -525,17 +569,12 @@ def synthesize_explosion(
     freqs = np.fft.rfftfreq(n_fft, 1.0 / rendering.sample_rate)
     src_spec = np.fft.rfft(wave_src, n_fft)
 
-    # Direct path transfer
+    # Direct and ground path transfers
     delay_d, alpha_d = _compute_transfer(src, rec, atmos, freqs, atmos.rh)
-    H_d = (1.0 / d_direct) * np.exp(-alpha_d) * np.exp(-1j * 2 * np.pi * freqs * delay_d)
-
-    # Ground reflected path
     src_img = np.array([src[0], src[1], -src[2]])
     delay_g, alpha_g = _compute_transfer(src_img, rec, atmos, freqs, atmos.rh)
 
-    # Incidence angle for reflection coefficient
     if src[2] > 0:
-        # reflection point via image method
         t_ref = src[2] / (src[2] + rec[2]) if (src[2] + rec[2]) != 0 else 0.5
         ref_pt = src_img + t_ref * (rec - src_img)
         vec_inc = ref_pt - src
@@ -545,15 +584,29 @@ def synthesize_explosion(
         theta = 0.0
 
     Rg = _reflection_coefficient(freqs, geo.flow_resistivity, theta)
-    H_g = (
-        Rg
-        * (1.0 / d_img)
-        * np.exp(-alpha_g)
-        * np.exp(-1j * 2 * np.pi * freqs * delay_g)
-    )
 
-    total_spec = src_spec * (H_d + H_g)
-    wave = np.fft.irfft(total_spec, n_fft)
+    if rendering.use_burgers:
+        H_d = (1.0 / d_direct) * np.exp(-1j * 2 * np.pi * freqs * delay_d)
+        H_g = Rg * (1.0 / d_img) * np.exp(-1j * 2 * np.pi * freqs * delay_g)
+    else:
+        H_d = (1.0 / d_direct) * np.exp(-alpha_d) * np.exp(-1j * 2 * np.pi * freqs * delay_d)
+        H_g = (
+            Rg
+            * (1.0 / d_img)
+            * np.exp(-alpha_g)
+            * np.exp(-1j * 2 * np.pi * freqs * delay_g)
+        )
+
+    spec_d = src_spec * H_d
+    spec_g = src_spec * H_g
+    wave_d = np.fft.irfft(spec_d, n_fft)
+    wave_g = np.fft.irfft(spec_g, n_fft)
+
+    if rendering.use_burgers:
+        wave_d = propagate_burgers(wave_d, d_direct, atmos, rendering.sample_rate)
+        wave_g = propagate_burgers(wave_g, d_img, atmos, rendering.sample_rate)
+
+    wave = wave_d + wave_g
 
     # Trim to relevant portion
     n_out = int((max(delay_d, delay_g) + 8 * t_plus + rendering.pad) * rendering.sample_rate)
