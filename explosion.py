@@ -41,6 +41,10 @@ __all__ = [
     "synthesize_simple",
     "save_wav",
     "solve_retarded_time",
+    "estimate_charge_radius",
+    "minphase_from_mag",
+    "source_mag_shaper",
+    "apply_source_shaper",
 ]
 
 
@@ -62,11 +66,20 @@ class Ordnance:
     height_of_burst : float, optional
         Height of burst above ground in metres.  Used only for the empirical
         height-of-burst boost to peak overpressure.
+    charge_radius_m : float, optional
+        Explicit charge radius.  If ``None`` it is estimated from mass.
+    burst_type : str, optional
+        One of {"air", "surface", "buried"} controlling emission model.
+    directivity_q : float, optional
+        Exponent for cosine directivity lobe when ``burst_type`` is "surface".
     """
 
     filler_mass: float
     re: float = 1.0
     height_of_burst: float = 0.0
+    charge_radius_m: float | None = None
+    burst_type: str = "air"
+    directivity_q: float = 1.0
 
     @property
     def tnt_equivalent(self) -> float:
@@ -167,6 +180,7 @@ class Rendering:
     pad: float = 0.5  # seconds of trailing silence
     target_peak_pa: float | None = None
     use_burgers: bool = True
+    enable_source_shaper: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -241,6 +255,17 @@ def incidence_angle_for_ground(xs: Vec3, xr: Vec3) -> float:
     inc = ref_pt - np.array(xs)
     cos_th = abs(inc[2]) / (np.linalg.norm(inc) + 1e-12)
     return float(np.arccos(np.clip(cos_th, 0.0, 1.0)))
+
+
+def _directivity_scalar(ord: Ordnance, vec: np.ndarray) -> float:
+    """Simple cosine directivity towards +Z."""
+    if ord.burst_type != "surface":
+        return 1.0
+    n = np.linalg.norm(vec)
+    if n <= 0:
+        return 1.0
+    cos_e = vec[2] / n
+    return float(max(cos_e, 0.0) ** ord.directivity_q)
 
 
 def design_absorption_fir(D_ref: float, atmos: AtmosphereWT, sr: int, taps: int = 512) -> np.ndarray:
@@ -450,6 +475,84 @@ def _source_waveform(ord: Ordnance, rendering: Rendering, range_m: float) -> Tup
 
 
 # ---------------------------------------------------------------------------
+# Source shaping
+# ---------------------------------------------------------------------------
+
+
+def estimate_charge_radius(W_kg: float, rho_eff: float = 1600.0) -> float:
+    """Approximate spherical charge radius from mass and density."""
+    a = (3.0 * W_kg / (4.0 * np.pi * rho_eff)) ** (1.0 / 3.0)
+    return float(np.maximum(a, 0.0))
+
+
+def minphase_from_mag(mag: np.ndarray) -> np.ndarray:
+    """Convert magnitude to minimum-phase spectrum."""
+    mag = np.asarray(mag, float)
+    mag = np.maximum(mag, 1e-6)
+    n = (len(mag) - 1) * 2
+    log_mag = np.log(mag)
+    cep = np.fft.irfft(log_mag, n)
+    cep[1 : n // 2] *= 2.0
+    cep[n // 2 + 1 :] = 0.0
+    return np.exp(np.fft.rfft(cep, n))
+
+
+def source_mag_shaper(
+    freqs: np.ndarray,
+    ord: Ordnance,
+    geom: Geometry,
+    atmos: AtmosphereWT,
+    debug: bool = False,
+) -> np.ndarray | tuple:
+    """Magnitude shaper |S(f)| for finite radius and HOB."""
+
+    a = ord.charge_radius_m if ord.charge_radius_m is not None else estimate_charge_radius(ord.tnt_equivalent)
+    a = float(np.clip(a, 0.02, 1.0))
+    c0 = float(atmos.speed_of_sound(0.0))
+    fc = 0.5 * c0 / max(a, 1e-3)
+    # Finite source radius low-pass ~ c/(2a)
+    lp = 1.0 / (1.0 + (freqs / fc) ** 4)
+
+    if ord.burst_type == "buried":
+        hob = np.ones_like(freqs)
+    else:
+        tau = 2.0 * max(ord.height_of_burst, 0.0) / c0
+        R0 = _reflection_coefficient(freqs, geom.flow_resistivity, 0.0)
+        if ord.burst_type == "surface":
+            # Surface burst → |1 + R|
+            hob = np.abs(1.0 + R0)
+            hob = np.minimum(hob, 2.0)
+        elif tau > 2 * a / c0:
+            # Air burst HOB interference
+            hob = np.abs(1.0 + R0 * np.exp(-1j * 2 * np.pi * freqs * tau))
+        else:
+            hob = np.ones_like(freqs)
+
+    shelf = 1.0
+    if ord.burst_type == "buried":
+        # Buried charges radiate stronger LF
+        fb = 150.0
+        shelf = 1.0 / (1.0 + (freqs / fb) ** 2)
+
+    mag = lp * hob * shelf
+    mag = np.maximum(mag, 1e-6)
+    spec = minphase_from_mag(mag)
+    spec[0] = spec[0].real
+    if debug:
+        return spec, {"lp": lp, "hob": hob, "mag": mag}
+    return spec
+
+
+def apply_source_shaper(wave: np.ndarray, sr: int, S_mp: np.ndarray) -> np.ndarray:
+    """Apply minimum-phase spectrum to ``wave`` in-place."""
+    n_fft = (len(S_mp) - 1) * 2
+    spec = np.fft.rfft(wave, n_fft)
+    spec *= S_mp
+    out = np.fft.irfft(spec, n_fft)
+    return out[: len(wave)]
+
+
+# ---------------------------------------------------------------------------
 # Time-varying propagation path
 # ---------------------------------------------------------------------------
 
@@ -479,6 +582,11 @@ def synthesize_explosion_tv(
     sr = rendering.sample_rate
     d_ref = np.linalg.norm(np.array(geo.rec_fn(0.0), float) - np.array(geo.src_fn(0.0), float))
     p_src, t_plus, _ = _source_waveform(ord, rendering, range_m=max(d_ref, 1e-6))
+    n_fft = int(2 ** np.ceil(np.log2(len(p_src))))
+    freqs = np.fft.rfftfreq(n_fft, 1.0 / sr)
+    if rendering.enable_source_shaper:
+        S_mp = source_mag_shaper(freqs, ord, geo, atmos)
+        p_src = apply_source_shaper(p_src, sr, S_mp)
     spline = make_source_spline(p_src, sr)
 
     T_out = (len(p_src) / sr) + _estimate_max_delay(geo, atmos) + rendering.pad
@@ -495,24 +603,39 @@ def synthesize_explosion_tv(
 
     for n in range(n_out):
         t_r = n / sr
+        xr = np.array(geo.rec_fn(t_r), float)
 
         t_e, Dd, _ = solve_retarded_time(geo.src_fn, geo.rec_fn, t_r, atmos)
+        xs = np.array(geo.src_fn(t_e), float)
         pd_val = spline(t_e) if 0.0 <= t_e <= len(p_src) / sr else 0.0
         pd = float(pd_val) if np.isfinite(pd_val) else 0.0
-        yd = pd / max(Dd, 1e-6)
+        vec_dir = xr - xs
+        D_dir = _directivity_scalar(ord, vec_dir) if xr[2] >= 0 else 1.0
+        yd = (D_dir * pd) / max(Dd, 1e-6)
 
         def src_img_fn(te: float) -> Vec3:
             x = geo.src_fn(te)
             return (x[0], x[1], -x[2])
 
         t_ei, Dg, _ = solve_retarded_time(src_img_fn, geo.rec_fn, t_r, atmos)
+        xs_i = np.array(geo.src_fn(t_ei), float)
         pg_val = spline(t_ei) if 0.0 <= t_ei <= len(p_src) / sr else 0.0
         pg = float(pg_val) if np.isfinite(pg_val) else 0.0
-
-        theta = incidence_angle_for_ground(geo.src_fn(t_ei), geo.rec_fn(t_r))
+        xs_img = np.array([xs_i[0], xs_i[1], -xs_i[2]])
+        v = xr - xs_img
+        if abs(v[2]) < 1e-12:
+            t_ref = 0.5
+        else:
+            t_ref = -xs_img[2] / v[2]
+        t_ref = float(np.clip(t_ref, 0.0, 1.0))
+        ref_pt = xs_img + t_ref * v
+        vec_img = ref_pt - xs_i
+        cos_th = abs(vec_img[2]) / (np.linalg.norm(vec_img) + 1e-12)
+        theta = float(np.arccos(np.clip(cos_th, 0.0, 1.0)))
         Rg_bb = float(np.real(_reflection_coefficient(np.array([1000.0]), geo.flow_resistivity, theta)[0]))
         Rg_bb = float(np.clip(Rg_bb, -1.0, 1.0))
-        yg = (Rg_bb * pg) / max(Dg, 1e-6)
+        D_img = _directivity_scalar(ord, vec_img) if xr[2] >= 0 else 1.0
+        yg = (D_img * Rg_bb * pg) / max(Dg, 1e-6)
 
         y[n] = yd + yg
 
@@ -567,6 +690,9 @@ def synthesize_explosion(
     )
 
     freqs = np.fft.rfftfreq(n_fft, 1.0 / rendering.sample_rate)
+    if rendering.enable_source_shaper:
+        S_mp = source_mag_shaper(freqs, ord, geo, atmos)
+        wave_src = apply_source_shaper(wave_src, rendering.sample_rate, S_mp)
     src_spec = np.fft.rfft(wave_src, n_fft)
 
     # Direct and ground path transfers
@@ -574,14 +700,19 @@ def synthesize_explosion(
     src_img = np.array([src[0], src[1], -src[2]])
     delay_g, alpha_g = _compute_transfer(src_img, rec, atmos, freqs, atmos.rh)
 
+    vec_dir = rec - src
+    D_dir = _directivity_scalar(ord, vec_dir) if rec[2] >= 0 else 1.0
+
     if src[2] > 0:
         t_ref = src[2] / (src[2] + rec[2]) if (src[2] + rec[2]) != 0 else 0.5
         ref_pt = src_img + t_ref * (rec - src_img)
         vec_inc = ref_pt - src
+        D_img = _directivity_scalar(ord, vec_inc) if rec[2] >= 0 else 1.0
         cos_theta = abs(vec_inc[2]) / np.linalg.norm(vec_inc)
         theta = np.arccos(np.clip(cos_theta, 0.0, 1.0))
     else:
         theta = 0.0
+        D_img = 1.0
 
     Rg = _reflection_coefficient(freqs, geo.flow_resistivity, theta)
 
@@ -596,6 +727,9 @@ def synthesize_explosion(
             * np.exp(-alpha_g)
             * np.exp(-1j * 2 * np.pi * freqs * delay_g)
         )
+
+    H_d *= D_dir
+    H_g *= D_img
 
     spec_d = src_spec * H_d
     spec_g = src_spec * H_g
