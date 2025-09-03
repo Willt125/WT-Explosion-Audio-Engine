@@ -1,6 +1,8 @@
-import numpy as np
-from explosion import AtmosphereWT, Geometry, Ordnance, Rendering, synthesize_explosion
+"""Tests for nonlinear Burgers propagation."""
 
+import numpy as np
+
+from explosion import AtmosphereWT, Geometry, Ordnance, Rendering, synthesize_explosion
 
 def _rise_time(w, sr):
     idx = int(np.argmax(w))
