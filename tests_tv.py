@@ -20,7 +20,7 @@ def test_static_regression():
     ord = Ordnance(10.0, re=1.0, height_of_burst=0.0)
     geo = Geometry(source=(0.0, 0.0, 1.0), receiver=(100.0, 0.0, 1.7))
     atmos = AtmosphereWT(rh=0.5)
-    render = Rendering(sample_rate=8000, pad=0.2)
+    render = Rendering(sample_rate=8000, pad=0.2, use_burgers=False)
     w_static = synthesize_explosion(ord, geo, atmos, render)
     w_tv = synthesize_explosion_tv(ord, geo, atmos, render)
     idx = np.argmax(np.abs(w_static))
@@ -36,7 +36,7 @@ def test_doppler_glide():
     src = LinearMotion((-300.0, 0.0, 50.0), (200.0, 0.0, 0.0))
     geo = Geometry(source=src, receiver=(0.0, 0.0, 1.7))
     atmos = AtmosphereWT(rh=0.5)
-    render = Rendering(sample_rate=8000, pad=0.2)
+    render = Rendering(sample_rate=8000, pad=0.2, use_burgers=False)
     y = synthesize_explosion(ord, geo, atmos, render)
     f, t, S = spectrogram(y, fs=render.sample_rate, nperseg=512, noverlap=256)
     ridge = f[np.argmax(S, axis=0)]
@@ -56,7 +56,7 @@ def test_energy_falloff():
     rec_motion = LinearMotion((50.0, 0.0, 1.7), (100.0, 0.0, 0.0))
     geo = Geometry(source=src, receiver=rec_motion)
     atmos = AtmosphereWT(rh=0.0)
-    render = Rendering(sample_rate=8000, pad=0.2)
+    render = Rendering(sample_rate=8000, pad=0.2, use_burgers=False)
     import explosion
 
     orig_design = explosion.design_absorption_fir
@@ -80,7 +80,7 @@ def test_ground_image_on_off():
     geo_soft = Geometry(source=src, receiver=rec, flow_resistivity=5e4)
     geo_rigid = Geometry(source=src, receiver=rec, flow_resistivity=1e12)
     atmos = AtmosphereWT(rh=0.5)
-    render = Rendering(sample_rate=8000, pad=0.2)
+    render = Rendering(sample_rate=8000, pad=0.2, use_burgers=False)
     y_soft = synthesize_explosion_tv(ord, geo_soft, atmos, render)
     y_rigid = synthesize_explosion_tv(ord, geo_rigid, atmos, render)
     idx = np.argmax(np.abs(y_rigid))
