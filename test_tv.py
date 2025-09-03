@@ -1,8 +1,12 @@
 import os
+"""Tests for time-varying propagation utilities."""
+
+import os
+
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.signal import spectrogram
 from scipy.ndimage import maximum_filter1d
+from scipy.signal import spectrogram
 
 from explosion import (
     AtmosphereWT,
